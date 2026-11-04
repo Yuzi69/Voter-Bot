@@ -36,8 +36,8 @@ from aiogram.exceptions import TelegramAPIError
 # CONFIGURATION
 # ============================================================
 
-BOT_TOKEN = "PASTE_MAIN_BOT_TOKEN"
-OWNER_ID = 123456789
+BOT_TOKEN = "9163340229:AAEmiPxczk53WJFo3C6BD83fQlGMpRY2V4Q"
+OWNER_ID = 9290242587
 
 DB_PATH = "vote_maker.sqlite3"
 
