@@ -1,99 +1,79 @@
-# vote_bot.py
-# Python 3.10+
-# Telegram Vote Bot Studio
-# Aiogram 3 + SQLite + Pillow
-
 import asyncio
-import logging
 import sqlite3
 import time
 import io
-import os
-import math
+import logging
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFont
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode, ChatMemberStatus
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup,
-    InlineKeyboardButton, ReplyKeyboardMarkup,
-    KeyboardButton, BufferedInputFile
+    Message, CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    BufferedInputFile
 )
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode, ChatMemberStatus
 
-# ==================================================
-# CONFIGURATION
-# ==================================================
+# ==========================================
+# CONFIG
+# ==========================================
 
 BOT_TOKEN = "9163340229:AAEmiPxczk53WJFo3C6BD83fQlGMpRY2V4Q"
-OWNER_ID = 9290242587  # Your Telegram numeric ID
+OWNER_ID = 9290242587
 
-DB = "vote_bot.db"
+DB = "vote_maker.db"
 
 logging.basicConfig(level=logging.INFO)
 
 dp = Dispatcher()
 main_bot = None
 
-active_bots = {}
 
-# ==================================================
+# ==========================================
 # DATABASE
-# ==================================================
+# ==========================================
 
-def connect():
-    con = sqlite3.connect(DB, timeout=30)
+def db():
+    con = sqlite3.connect(DB)
     con.row_factory = sqlite3.Row
     return con
 
 
 def init_db():
-    con = connect()
+    con = db()
 
     con.executescript("""
-    CREATE TABLE IF NOT EXISTS bots(
-        bot_id INTEGER PRIMARY KEY,
-        token TEXT NOT NULL,
-        username TEXT,
-        owner_id INTEGER
-    );
-
     CREATE TABLE IF NOT EXISTS admins(
-        bot_id INTEGER,
-        user_id INTEGER,
-        PRIMARY KEY(bot_id,user_id)
+        user_id INTEGER PRIMARY KEY
     );
 
     CREATE TABLE IF NOT EXISTS channels(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        bot_id INTEGER,
         chat_id TEXT,
         title TEXT,
-        join_url TEXT,
-        UNIQUE(bot_id,chat_id)
+        url TEXT
     );
 
     CREATE TABLE IF NOT EXISTS settings(
-        bot_id INTEGER PRIMARY KEY,
+        id INTEGER PRIMARY KEY,
         vote_channel TEXT
     );
 
     CREATE TABLE IF NOT EXISTS states(
-        bot_id INTEGER,
-        user_id INTEGER,
+        user_id INTEGER PRIMARY KEY,
         state TEXT,
-        data TEXT,
-        PRIMARY KEY(bot_id,user_id)
+        data TEXT
     );
 
     CREATE TABLE IF NOT EXISTS contests(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        bot_id INTEGER,
-        creator_id INTEGER,
         title TEXT,
-        channel_id TEXT,
+        channel TEXT,
         message_id INTEGER,
         ends_at INTEGER,
         status TEXT DEFAULT 'active'
@@ -103,30 +83,34 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         contest_id INTEGER,
         name TEXT,
-        photo TEXT DEFAULT ''
+        photo TEXT
     );
 
     CREATE TABLE IF NOT EXISTS votes(
         contest_id INTEGER,
         user_id INTEGER,
         candidate_id INTEGER,
-        updated_at INTEGER,
         PRIMARY KEY(contest_id,user_id)
     );
     """)
+
+    con.execute(
+        "INSERT OR IGNORE INTO admins VALUES(?)",
+        (OWNER_ID,)
+    )
 
     con.commit()
     con.close()
 
 
-def sql(q, args=(), mode=None):
-    con = connect()
-    cur = con.execute(q, args)
+def query(sql, args=(), fetch=False, all_rows=False):
+    con = db()
+    cur = con.execute(sql, args)
 
-    if mode == "one":
-        result = cur.fetchone()
-    elif mode == "all":
+    if all_rows:
         result = cur.fetchall()
+    elif fetch:
+        result = cur.fetchone()
     else:
         result = None
 
@@ -136,96 +120,88 @@ def sql(q, args=(), mode=None):
     return result
 
 
-def admin_add(bot_id, user_id):
-    sql(
-        "INSERT OR IGNORE INTO admins VALUES(?,?)",
-        (bot_id, user_id)
+def set_state(uid, state, data=""):
+    query("""
+        INSERT INTO states VALUES(?,?,?)
+        ON CONFLICT(user_id)
+        DO UPDATE SET state=excluded.state,
+                      data=excluded.data
+    """, (uid, state, data))
+
+
+def get_state(uid):
+    r = query(
+        "SELECT * FROM states WHERE user_id=?",
+        (uid,), fetch=True
     )
-
-
-def is_admin(bot_id, user_id):
-    return bool(sql(
-        "SELECT 1 FROM admins WHERE bot_id=? AND user_id=?",
-        (bot_id, user_id), "one"
-    ))
-
-
-def set_state(bot_id, user_id, state, data=""):
-    sql("""
-    INSERT INTO states VALUES(?,?,?,?)
-    ON CONFLICT(bot_id,user_id)
-    DO UPDATE SET state=excluded.state,data=excluded.data
-    """, (bot_id, user_id, state, data))
-
-
-def get_state(bot_id, user_id):
-    r = sql(
-        "SELECT state,data FROM states WHERE bot_id=? AND user_id=?",
-        (bot_id, user_id), "one"
-    )
-
     return (r["state"], r["data"]) if r else ("", "")
 
 
-def clear_state(bot_id, user_id):
-    sql(
-        "DELETE FROM states WHERE bot_id=? AND user_id=?",
-        (bot_id, user_id)
+def clear_state(uid):
+    query("DELETE FROM states WHERE user_id=?", (uid,))
+
+
+def is_admin(uid):
+    return bool(query(
+        "SELECT 1 FROM admins WHERE user_id=?",
+        (uid,), fetch=True
+    ))
+
+
+# ==========================================
+# BUTTON HELPERS
+# ==========================================
+
+def under(text):
+    return "".join(
+        char + "\u0332" for char in text
     )
 
 
-# ==================================================
-# BUTTON DESIGN
-# ==================================================
-
-def ib(text, data, style="primary"):
+def button(text, data, style="primary"):
     return InlineKeyboardButton(
-        text=text,
+        text=under(text),
         callback_data=data,
         style=style
     )
 
 
-def main_menu():
+def menu():
     return ReplyKeyboardMarkup(
         keyboard=[
             [
                 KeyboardButton(
-                    text="🆕 ɴᴇᴡ ᴄᴏɴᴛᴇꜱᴛ",
+                    text=under("🆕 NEW CONTEST"),
                     style="success"
                 ),
                 KeyboardButton(
-                    text="📊 ᴍʏ ᴄᴏɴᴛᴇꜱᴛꜱ",
+                    text=under("📊 MY CONTESTS"),
                     style="primary"
                 )
             ],
             [
                 KeyboardButton(
-                    text="➕ ᴀᴅᴅ ᴄʜᴀɴɴᴇʟ",
+                    text=under("➕ ADD CHANNEL"),
                     style="primary"
                 ),
                 KeyboardButton(
-                    text="📢 ꜱᴇᴛ ᴠᴏᴛᴇ ᴄʜᴀɴɴᴇʟ",
+                    text=under("📢 VOTE CHANNEL"),
                     style="primary"
                 )
             ],
             [
                 KeyboardButton(
-                    text="🤖 ᴄʟᴏɴᴇ ʙᴏᴛ",
-                    style="success"
+                    text=under("📈 STATISTICS"),
+                    style="primary"
                 ),
                 KeyboardButton(
-                    text="📈 ꜱᴛᴀᴛᴜꜱ",
-                    style="primary"
-                )
-            ],
-            [
-                KeyboardButton(
-                    text="🗑 ʀᴇᴍᴏᴠᴇ ᴄʜᴀɴɴᴇʟ",
+                    text=under("🗑 REMOVE CHANNEL"),
                     style="danger"
-                ),
+                )
+            ],
+            [
                 KeyboardButton(
-                    text="❓ ʜᴇʟᴘ",
+                    text=under("❓ HELP"),
                     style="primary"
                 )
             ]
@@ -234,58 +210,54 @@ def main_menu():
     )
 
 
-def duration_buttons():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                ib("𝟱 ʜᴏᴜʀꜱ", "time:5"),
-                ib("𝟭𝟬 ʜᴏᴜʀꜱ", "time:10")
-            ],
-            [
-                ib("𝟮𝟰 ʜᴏᴜʀꜱ", "time:24"),
-                ib("ᴄᴜꜱᴛᴏᴍ", "time:custom", "success")
-            ]
-        ]
+# ==========================================
+# WELCOME
+# ==========================================
+
+@dp.message(CommandStart())
+async def start(message: Message):
+
+    name = message.from_user.first_name or "User"
+
+    welcome = (
+        f"👋 ʜᴇʟʟᴏ, <b>{name}</b>!\n\n"
+        "ᴡᴇʟᴄᴏᴍᴇ ᴛᴏ ᴠᴏᴛᴇ ᴍᴀᴋᴇʀ ʙᴏᴛ.\n\n"
+        "ᴄʀᴇᴀᴛᴇ ᴠᴏᴛɪɴɢ ᴄᴏɴᴛᴇꜱᴛꜱ, "
+        "ᴍᴀɴᴀɢᴇ ᴠᴏᴛᴇꜱ ᴀɴᴅ ᴅɪꜱᴘʟᴀʏ ᴡɪɴɴᴇʀꜱ.\n\n"
+        "👇 ꜱᴇʟᴇᴄᴛ ᴀɴ ᴏᴘᴛɪᴏɴ ʙᴇʟᴏᴡ."
     )
 
+    if is_admin(message.from_user.id):
+        await message.answer(
+            welcome,
+            reply_markup=menu()
+        )
+    else:
+        if not await check_join(
+            message.bot,
+            message.from_user.id
+        ):
+            await show_join(message)
+            return
 
-async def home(message):
-    await message.answer(
-        "<b>⚡ ᴠᴏᴛᴇ ʙᴏᴛ ꜱᴛᴜᴅɪᴏ</b>\n\n"
-        "ᴅᴇꜱɪɢɴ • ᴅᴇᴘʟᴏʏ • ᴍᴀɴᴀɢᴇ\n\n"
-        "🎯 ꜱᴇʟᴇᴄᴛ ᴀɴ ᴏᴘᴛɪᴏɴ",
-        reply_markup=main_menu()
+        await message.answer(welcome)
+
+
+# ==========================================
+# FORCE SUBSCRIPTION
+# ==========================================
+
+async def check_join(bot, uid):
+
+    channels = query(
+        "SELECT * FROM channels",
+        all_rows=True
     )
-
-
-# ==================================================
-# CHANNEL SYSTEM
-# ==================================================
-
-def get_channels(bot_id):
-    return sql(
-        "SELECT * FROM channels WHERE bot_id=?",
-        (bot_id,), "all"
-    )
-
-
-def get_vote_channel(bot_id):
-    r = sql(
-        "SELECT vote_channel FROM settings WHERE bot_id=?",
-        (bot_id,), "one"
-    )
-
-    return r["vote_channel"] if r else None
-
-
-async def check_join(bot, bot_id, user_id):
-
-    channels = get_channels(bot_id)
 
     for ch in channels:
         try:
             member = await bot.get_chat_member(
-                ch["chat_id"], user_id
+                ch["chat_id"], uid
             )
 
             if member.status in (
@@ -300,42 +272,39 @@ async def check_join(bot, bot_id, user_id):
     return True
 
 
-async def join_required(message):
+async def show_join(message):
 
-    bot = message.bot
-    bid = bot.id
-    uid = message.from_user.id
-
-    if is_admin(bid, uid):
-        return True
-
-    if await check_join(bot, bid, uid):
-        return True
+    channels = query(
+        "SELECT * FROM channels",
+        all_rows=True
+    )
 
     rows = []
 
-    for ch in get_channels(bid):
-
+    for ch in channels:
         rows.append([
             InlineKeyboardButton(
-                text="➕ ᴊᴏɪɴ " + (ch["title"] or "ᴄʜᴀɴɴᴇʟ")[:25],
-                url=ch["join_url"]
+                text="➕ " + ch["title"],
+                url=ch["url"]
             )
         ])
 
     rows.append([
-        ib("✅ ᴠᴇʀɪꜰʏ ᴊᴏɪɴ", "verify", "success")
+        button(
+            "VERIFY JOIN",
+            "verify",
+            "success"
+        )
     ])
 
     await message.answer(
-        "<b>🔒 ᴊᴏɪɴ ʀᴇQᴜɪʀᴇᴅ</b>\n\n"
-        "ᴊᴏɪɴ ᴀʟʟ ᴄʜᴀɴɴᴇʟꜱ ᴛᴏ ᴜꜱᴇ ᴛʜᴇ ʙᴏᴛ.",
+        "🔒 <b>CHANNEL SUBSCRIPTION REQUIRED</b>\n\n"
+        "ᴊᴏɪɴ ᴀʟʟ ʀᴇQᴜɪʀᴇᴅ ᴄʜᴀɴɴᴇʟꜱ "
+        "ᴛᴏ ᴄᴏɴᴛɪɴᴜᴇ.",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=rows
         )
     )
-
-    return False
 
 
 @dp.callback_query(F.data == "verify")
@@ -343,55 +312,475 @@ async def verify(call):
 
     if await check_join(
         call.bot,
-        call.bot.id,
         call.from_user.id
     ):
-
         await call.message.edit_text(
-            "✅ <b>ᴠᴇʀɪꜰɪᴇᴅ ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟʟʏ</b>\n\n"
-            "ᴜꜱᴇ /start ᴛᴏ ᴄᴏɴᴛɪɴᴜᴇ."
+            "✅ ᴠᴇʀɪꜰɪᴄᴀᴛɪᴏɴ "
+            "ᴄᴏᴍᴘʟᴇᴛᴇᴅ ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟʟʏ."
         )
-
         await call.answer("Verified!")
 
     else:
         await call.answer(
-            "সব Channel Join করুন।",
+            "Join all required channels first.",
             show_alert=True
         )
 
 
-# ==================================================
-# CONTEST SYSTEM
-# ==================================================
+# ==========================================
+# ADMIN
+# ==========================================
 
-def contest_data(cid):
+@dp.message(Command("admin"))
+async def admin(message):
 
-    contest = sql(
-        "SELECT * FROM contests WHERE id=?",
-        (cid,), "one"
+    if is_admin(message.from_user.id):
+        await message.answer(
+            "⚙️ ᴀᴅᴍɪɴ ᴘᴀɴᴇʟ",
+            reply_markup=menu()
+        )
+    else:
+        await message.answer("Access denied.")
+
+
+@dp.message(Command("addadmin"))
+async def add_admin(message):
+
+    if not is_admin(message.from_user.id):
+        return
+
+    args = message.text.split()
+
+    if len(args) != 2 or not args[1].isdigit():
+        await message.answer(
+            "Usage: /addadmin USER_ID"
+        )
+        return
+
+    query(
+        "INSERT OR IGNORE INTO admins VALUES(?)",
+        (int(args[1]),)
     )
 
-    candidates = sql(
-        "SELECT * FROM candidates WHERE contest_id=?",
-        (cid,), "all"
+    await message.answer(
+        "✅ ᴀᴅᴍɪɴ ᴀᴅᴅᴇᴅ ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟʟʏ."
     )
 
-    counts = sql("""
-        SELECT candidate_id,COUNT(*) AS total
-        FROM votes WHERE contest_id=?
-        GROUP BY candidate_id
-    """, (cid,), "all")
 
-    vote_counts = {
-        r["candidate_id"]: r["total"]
-        for r in counts
-    }
+# ==========================================
+# CONTEST CREATION
+# ==========================================
 
-    return contest, candidates, vote_counts
+@dp.message(F.text)
+async def text_handler(message: Message):
+
+    uid = message.from_user.id
+    text = message.text.strip()
+
+    if not is_admin(uid):
+
+        if not await check_join(message.bot, uid):
+            await show_join(message)
+
+        return
+
+    state, data = get_state(uid)
+
+    # ADD CHANNEL
+
+    if state == "add_channel":
+
+        parts = text.split("|", 1)
+
+        channel = parts[0].strip()
+
+        try:
+            ch = await message.bot.get_chat(channel)
+
+            member = await message.bot.get_chat_member(
+                ch.id, message.bot.id
+            )
+
+            if member.status not in (
+                ChatMemberStatus.ADMINISTRATOR,
+                ChatMemberStatus.OWNER
+            ):
+                await message.answer(
+                    "Make the bot an administrator first."
+                )
+                return
+
+            url = (
+                parts[1].strip()
+                if len(parts) > 1
+                else "https://t.me/" + channel.lstrip("@")
+            )
+
+            query(
+                "INSERT INTO channels(chat_id,title,url) VALUES(?,?,?)",
+                (str(ch.id), ch.title or "Channel", url)
+            )
+
+            clear_state(uid)
+
+            await message.answer(
+                "✅ ᴄʜᴀɴɴᴇʟ ᴀᴅᴅᴇᴅ ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟʟʏ.",
+                reply_markup=menu()
+            )
+
+        except Exception as e:
+            await message.answer(
+                "Channel setup failed: " + str(e)[:150]
+            )
+
+        return
+
+    # SET VOTE CHANNEL
+
+    if state == "vote_channel":
+
+        try:
+            ch = await message.bot.get_chat(text)
+
+            member = await message.bot.get_chat_member(
+                ch.id, message.bot.id
+            )
+
+            if member.status not in (
+                ChatMemberStatus.ADMINISTRATOR,
+                ChatMemberStatus.OWNER
+            ):
+                await message.answer(
+                    "Make the bot an administrator first."
+                )
+                return
+
+            query("""
+                INSERT INTO settings(id,vote_channel)
+                VALUES(1,?)
+                ON CONFLICT(id)
+                DO UPDATE SET vote_channel=excluded.vote_channel
+            """, (str(ch.id),))
+
+            clear_state(uid)
+
+            await message.answer(
+                "✅ ᴠᴏᴛᴇ ᴄʜᴀɴɴᴇʟ ꜱᴇᴛ ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟʟʏ.",
+                reply_markup=menu()
+            )
+
+        except Exception as e:
+            await message.answer(
+                "Invalid channel: " + str(e)[:150]
+            )
+
+        return
+
+    # REMOVE CHANNEL
+
+    if state == "remove_channel":
+
+        query(
+            "DELETE FROM channels WHERE chat_id=? OR title=?",
+            (text, text)
+        )
+
+        clear_state(uid)
+
+        await message.answer(
+            "✅ ᴄʜᴀɴɴᴇʟ ʀᴇᴍᴏᴠᴇᴅ ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟʟʏ.",
+            reply_markup=menu()
+        )
+
+        return
+
+    # CONTEST TITLE
+
+    if state == "contest_title":
+
+        set_state(uid, "contest_time", text[:100])
+
+        await message.answer(
+            "⏳ <b>SELECT VOTING DURATION</b>",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        button("5 HOURS", "duration:5"),
+                        button("10 HOURS", "duration:10")
+                    ],
+                    [
+                        button("24 HOURS", "duration:24"),
+                        button("CUSTOM", "duration:custom", "success")
+                    ]
+                ]
+            )
+        )
+
+        return
+
+    # CUSTOM TIME
+
+    if state == "custom_time":
+
+        try:
+            hours = float(text)
+
+            if not 0 < hours <= 720:
+                raise ValueError
+
+            set_state(
+                uid,
+                "candidates",
+                data + "|" + str(int(hours * 3600))
+            )
+
+            await message.answer(
+                "ᴇɴᴛᴇʀ ᴄᴀɴᴅɪᴅᴀᴛᴇꜱ, ᴏɴᴇ ᴘᴇʀ ʟɪɴᴇ:\n\n"
+                "<code>RIFAT</code>\n"
+                "<code>ALFA</code>\n"
+                "<code>IRFAN</code>"
+            )
+
+        except ValueError:
+            await message.answer(
+                "Enter a valid duration between 1 and 720 hours."
+            )
+
+        return
+
+    # CANDIDATES
+
+    if state == "candidates":
+
+        try:
+
+            title, seconds = data.rsplit("|", 1)
+
+            names = [
+                x.strip()[:50]
+                for x in text.splitlines()
+                if x.strip()
+            ]
+
+            if len(names) < 2:
+                await message.answer(
+                    "Add at least two candidates."
+                )
+                return
+
+            setting = query(
+                "SELECT vote_channel FROM settings WHERE id=1",
+                fetch=True
+            )
+
+            if not setting:
+                await message.answer(
+                    "Set the vote channel first."
+                )
+                return
+
+            channel = setting["vote_channel"]
+
+            cid = query("""
+                INSERT INTO contests(title,channel,ends_at)
+                VALUES(?,?,?)
+            """, (
+                title,
+                channel,
+                int(time.time()) + int(seconds)
+            ))
+
+            # Retrieve contest ID
+            contest = query(
+                "SELECT MAX(id) AS id FROM contests",
+                fetch=True
+            )
+            cid = contest["id"]
+
+            for name in names:
+                query(
+                    "INSERT INTO candidates(contest_id,name,photo) VALUES(?,?,?)",
+                    (cid, name, "")
+                )
+
+            clear_state(uid)
+
+            await publish(message.bot, cid)
+
+            asyncio.create_task(
+                contest_timer(message.bot, cid)
+            )
+
+            await message.answer(
+                "✅ ᴄᴏɴᴛᴇꜱᴛ ᴘᴜʙʟɪꜱʜᴇᴅ ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟʟʏ.\n\n"
+                f"Contest ID: <code>{cid}</code>",
+                reply_markup=menu()
+            )
+
+        except Exception:
+            logging.exception("Contest creation error")
+            await message.answer(
+                "Contest creation failed. Check your channel settings."
+            )
+
+        return
+
+    # MAIN MENU
+
+    if text == "🆕 NEW CONTEST":
+
+        set_state(uid, "contest_title")
+
+        await message.answer(
+            "✍️ ᴇɴᴛᴇʀ ᴄᴏɴᴛᴇꜱᴛ ᴛɪᴛʟᴇ:"
+        )
+
+    elif text == "➕ ADD CHANNEL":
+
+        set_state(uid, "add_channel")
+
+        await message.answer(
+            "Send channel username or ID.\n\n"
+            "Public: <code>@channelusername</code>\n"
+            "Private: <code>-100123456789|https://t.me/+invite</code>"
+        )
+
+    elif text == "📢 VOTE CHANNEL":
+
+        set_state(uid, "vote_channel")
+
+        await message.answer(
+            "Send your voting channel username or ID."
+        )
+
+    elif text == "🗑 REMOVE CHANNEL":
+
+        channels = query(
+            "SELECT * FROM channels",
+            all_rows=True
+        )
+
+        if not channels:
+            await message.answer("No channels available.")
+            return
+
+        listing = "\n".join(
+            f"{c['title']} | {c['chat_id']}"
+            for c in channels
+        )
+
+        set_state(uid, "remove_channel")
+
+        await message.answer(
+            "Send channel ID or title to remove:\n\n" + listing
+        )
+
+    elif text == "📊 MY CONTESTS":
+
+        contests = query(
+            "SELECT * FROM contests ORDER BY id DESC LIMIT 20",
+            all_rows=True
+        )
+
+        if not contests:
+            await message.answer("No contests found.")
+            return
+
+        result = ["📊 <b>MY CONTESTS</b>\n"]
+
+        for c in contests:
+            result.append(
+                f"#{c['id']} • {c['title']} • {c['status']}"
+            )
+
+        await message.answer("\n".join(result))
+
+    elif text == "📈 STATISTICS":
+
+        total = query(
+            "SELECT COUNT(*) AS n FROM contests",
+            fetch=True
+        )["n"]
+
+        voters = query(
+            "SELECT COUNT(DISTINCT user_id) AS n FROM votes",
+            fetch=True
+        )["n"]
+
+        await message.answer(
+            f"<b>📈 STATISTICS</b>\n\n"
+            f"ᴛᴏᴛᴀʟ ᴄᴏɴᴛᴇꜱᴛꜱ: {total}\n"
+            f"ᴛᴏᴛᴀʟ ᴠᴏᴛᴇʀꜱ: {voters}"
+        )
+
+    elif text == "❓ HELP":
+
+        await message.answer(
+            "<b>ᴠᴏᴛᴇ ᴍᴀᴋᴇʀ ʙᴏᴛ ʜᴇʟᴘ</b>\n\n"
+            "1. Add required channels.\n"
+            "2. Set the voting channel.\n"
+            "3. Create a new contest.\n"
+            "4. Select voting duration.\n"
+            "5. Add candidates.\n"
+            "6. Publish your contest.\n\n"
+            "Admins can add more admins using /addadmin."
+        )
 
 
-def voting_keyboard(cid, candidates, counts, active=True):
+# ==========================================
+# DURATION CALLBACK
+# ==========================================
+
+@dp.callback_query(F.data.startswith("duration:"))
+async def duration(call):
+
+    uid = call.from_user.id
+
+    if not is_admin(uid):
+        await call.answer("Access denied.", show_alert=True)
+        return
+
+    state, title = get_state(uid)
+
+    if state != "contest_time":
+        await call.answer("Request expired.")
+        return
+
+    value = call.data.split(":")[1]
+
+    if value == "custom":
+
+        set_state(uid, "custom_time", title)
+
+        await call.message.answer(
+            "Enter duration in hours (maximum 720)."
+        )
+
+    else:
+
+        seconds = int(value) * 3600
+
+        set_state(
+            uid,
+            "candidates",
+            title + "|" + str(seconds)
+        )
+
+        await call.message.answer(
+            "ᴇɴᴛᴇʀ ᴄᴀɴᴅɪᴅᴀᴛᴇꜱ, ᴏɴᴇ ᴘᴇʀ ʟɪɴᴇ:\n\n"
+            "<code>RIFAT</code>\n"
+            "<code>ALFA</code>\n"
+            "<code>IRFAN</code>"
+        )
+
+    await call.answer()
+
+
+# ==========================================
+# VOTING KEYBOARD
+# ==========================================
+
+def vote_keyboard(cid, candidates, counts, active=True):
 
     rows = []
 
@@ -400,7 +789,7 @@ def voting_keyboard(cid, candidates, counts, active=True):
         count = counts.get(c["id"], 0)
 
         rows.append([
-            ib(
+            button(
                 f"{c['name']} • {count}",
                 f"vote:{cid}:{c['id']}",
                 "success"
@@ -409,7 +798,7 @@ def voting_keyboard(cid, candidates, counts, active=True):
 
     if not active:
         rows.append([
-            ib("ᴠᴏᴛɪɴɢ ᴄʟᴏꜱᴇᴅ", "closed", "danger")
+            button("VOTING CLOSED", "closed", "danger")
         ])
 
     return InlineKeyboardMarkup(
@@ -417,121 +806,77 @@ def voting_keyboard(cid, candidates, counts, active=True):
     )
 
 
-def create_contest(
-    bot_id,
-    user_id,
-    title,
-    channel,
-    duration,
-    candidates
-):
+def get_contest(cid):
 
-    con = connect()
+    contest = query(
+        "SELECT * FROM contests WHERE id=?",
+        (cid,), fetch=True
+    )
 
-    cur = con.execute("""
-        INSERT INTO contests(
-            bot_id,creator_id,title,channel_id,
-            ends_at,status
-        )
-        VALUES(?,?,?,?,?,'active')
-    """, (
-        bot_id,
-        user_id,
-        title,
-        channel,
-        int(time.time()) + duration
-    ))
+    candidates = query(
+        "SELECT * FROM candidates WHERE contest_id=?",
+        (cid,), all_rows=True
+    )
 
-    cid = cur.lastrowid
+    votes = query("""
+        SELECT candidate_id,COUNT(*) AS total
+        FROM votes
+        WHERE contest_id=?
+        GROUP BY candidate_id
+    """, (cid,), all_rows=True)
 
-    for name, photo in candidates:
+    counts = {
+        v["candidate_id"]: v["total"]
+        for v in votes
+    }
 
-        con.execute("""
-            INSERT INTO candidates(
-                contest_id,name,photo
-            )
-            VALUES(?,?,?)
-        """, (cid, name, photo))
-
-    con.commit()
-    con.close()
-
-    return cid
+    return contest, candidates, counts
 
 
-async def publish_contest(bot, cid):
+async def publish(bot, cid):
 
-    c, candidates, counts = contest_data(cid)
+    contest, candidates, counts = get_contest(cid)
 
-    end_time = time.strftime(
+    rows = vote_keyboard(
+        cid, candidates, counts
+    )
+
+    end = time.strftime(
         "%d %b %Y %H:%M UTC",
-        time.gmtime(c["ends_at"])
+        time.gmtime(contest["ends_at"])
     )
 
     text = (
-        f"🏆 <b>{c['title']}</b>\n\n"
-        "👇 ᴠᴏᴛᴇ ꜰᴏʀ ʏᴏᴜʀ ꜰᴀᴠᴏᴜʀɪᴛᴇ\n\n"
-        f"⏳ ᴇɴᴅꜱ: <code>{end_time}</code>\n\n"
-        "ᴄʟɪᴄᴋ ᴀ ʙᴜᴛᴛᴏɴ ᴛᴏ ᴠᴏᴛᴇ."
+        f"🏆 <b>{contest['title']}</b>\n\n"
+        "ᴠᴏᴛᴇ ꜰᴏʀ ʏᴏᴜʀ ꜰᴀᴠᴏᴜʀɪᴛᴇ.\n\n"
+        f"⏳ ᴇɴᴅꜱ: <code>{end}</code>\n\n"
+        "👇 ꜱᴇʟᴇᴄᴛ ʏᴏᴜʀ ᴄᴀɴᴅɪᴅᴀᴛᴇ."
     )
 
     msg = await bot.send_message(
-        c["channel_id"],
+        contest["channel"],
         text,
-        reply_markup=voting_keyboard(
-            cid, candidates, counts
-        )
+        reply_markup=rows
     )
 
-    sql(
+    query(
         "UPDATE contests SET message_id=? WHERE id=?",
         (msg.message_id, cid)
     )
 
 
-async def refresh_vote(bot, cid):
-
-    c, candidates, counts = contest_data(cid)
-
-    if not c or not c["message_id"]:
-        return
-
-    try:
-
-        await bot.edit_message_reply_markup(
-            chat_id=c["channel_id"],
-            message_id=c["message_id"],
-            reply_markup=voting_keyboard(
-                cid,
-                candidates,
-                counts,
-                c["status"] == "active"
-            )
-        )
-
-    except Exception as e:
-        logging.warning("Vote refresh: %s", e)
-
-
-@dp.callback_query(F.data == "closed")
-async def closed(call):
-    await call.answer(
-        "Voting ended.",
-        show_alert=True
-    )
-
+# ==========================================
+# VOTE HANDLER
+# ==========================================
 
 @dp.callback_query(F.data.startswith("vote:"))
-async def vote_handler(call):
+async def vote(call):
 
-    bot = call.bot
-    bid = bot.id
     uid = call.from_user.id
 
-    if not await check_join(bot, bid, uid):
-
+    if not await check_join(call.bot, uid):
         await call.answer(
-            "আগে Required Channel Join করুন।",
+            "Join all required channels first.",
             show_alert=True
         )
         return
@@ -541,197 +886,185 @@ async def vote_handler(call):
         cid = int(cid)
         candidate_id = int(candidate_id)
 
-    except Exception:
+    except ValueError:
         await call.answer("Invalid vote.")
         return
 
-    contest = sql(
-        "SELECT * FROM contests WHERE id=? AND bot_id=?",
-        (cid, bid), "one"
-    )
+    contest, candidates, counts = get_contest(cid)
 
-    candidate = sql(
-        "SELECT * FROM candidates WHERE id=? AND contest_id=?",
-        (candidate_id, cid), "one"
-    )
-
-    if not contest or not candidate:
-        await call.answer("Invalid candidate.")
-        return
-
-    if contest["status"] != "active":
-        await call.answer("Voting closed.", show_alert=True)
+    if not contest or contest["status"] != "active":
+        await call.answer(
+            "Voting is closed.",
+            show_alert=True
+        )
         return
 
     if time.time() >= contest["ends_at"]:
-        await finish_contest(bot, cid)
-        await call.answer("Voting time ended.")
+        await finish_contest(call.bot, cid)
+        await call.answer("Voting ended.")
         return
 
-    old = sql(
-        "SELECT candidate_id FROM votes WHERE contest_id=? AND user_id=?",
-        (cid, uid), "one"
+    candidate = next(
+        (c for c in candidates if c["id"] == candidate_id),
+        None
     )
 
-    sql("""
-        INSERT INTO votes(
-            contest_id,user_id,candidate_id,updated_at
-        )
-        VALUES(?,?,?,?)
+    if not candidate:
+        await call.answer("Invalid candidate.")
+        return
+
+    previous = query(
+        "SELECT * FROM votes WHERE contest_id=? AND user_id=?",
+        (cid, uid), fetch=True
+    )
+
+    query("""
+        INSERT INTO votes(contest_id,user_id,candidate_id)
+        VALUES(?,?,?)
         ON CONFLICT(contest_id,user_id)
-        DO UPDATE SET
-        candidate_id=excluded.candidate_id,
-        updated_at=excluded.updated_at
-    """, (
-        cid, uid, candidate_id, int(time.time())
-    ))
+        DO UPDATE SET candidate_id=excluded.candidate_id
+    """, (cid, uid, candidate_id))
 
-    await refresh_vote(bot, cid)
+    await refresh_votes(call.bot, cid)
 
-    if old:
+    if previous:
         await call.answer(
-            "Vote changed: " + candidate["name"]
+            "ᴠᴏᴛᴇ ᴄʜᴀɴɢᴇᴅ ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟʟʏ."
         )
     else:
         await call.answer(
-            "Vote submitted: " + candidate["name"]
+            "ᴠᴏᴛᴇ ꜱᴜʙᴍɪᴛᴛᴇᴅ ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟʟʏ."
         )
 
 
-# ==================================================
-# WINNER IMAGE GENERATOR
-# ==================================================
+@dp.callback_query(F.data == "closed")
+async def closed(call):
+    await call.answer(
+        "Voting has ended.",
+        show_alert=True
+    )
 
-def get_font(size):
+
+async def refresh_votes(bot, cid):
+
+    contest, candidates, counts = get_contest(cid)
+
+    if not contest or not contest["message_id"]:
+        return
+
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=contest["channel"],
+            message_id=contest["message_id"],
+            reply_markup=vote_keyboard(
+                cid,
+                candidates,
+                counts,
+                contest["status"] == "active"
+            )
+        )
+    except Exception:
+        pass
+
+
+# ==========================================
+# WINNER IMAGE
+# ==========================================
+
+def font(size):
 
     paths = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/system/fonts/Roboto-Bold.ttf"
     ]
 
-    for p in paths:
-        if os.path.exists(p):
-            return ImageFont.truetype(p, size)
+    for path in paths:
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            pass
 
     return ImageFont.load_default()
 
 
-def winner_image(name, photo=None):
+def make_winner_image(name):
 
-    W, H = 1536, 614
+    width, height = 1536, 614
 
-    img = Image.new("RGB", (W, H), (65, 8, 150))
+    image = Image.new(
+        "RGB",
+        (width, height),
+        (76, 28, 130)
+    )
 
-    draw = ImageDraw.Draw(img)
+    draw = ImageDraw.Draw(image)
 
-    # Purple gradient background
-    for y in range(H):
-        ratio = y / H
+    # Gradient background
+    for y in range(height):
+        ratio = y / height
+
         color = (
-            int(65 + 65 * ratio),
-            int(5 + 10 * ratio),
-            int(145 + 75 * ratio)
-        )
-        draw.line((0, y, W, y), fill=color)
-
-    # Decorative circles
-    for x, y, r in [
-        (100, 100, 200),
-        (700, 50, 130),
-        (1400, 550, 250)
-    ]:
-        draw.ellipse(
-            (x-r, y-r, x+r, y+r),
-            outline=(150, 70, 255),
-            width=8
+            int(50 + ratio * 60),
+            int(15 + ratio * 15),
+            int(110 + ratio * 100)
         )
 
-    # Heading
+        draw.line(
+            (0, y, width, y),
+            fill=color
+        )
+
+    # Decoration
+    draw.ellipse(
+        (1050, -100, 1450, 300),
+        outline=(180, 130, 255),
+        width=8
+    )
+
     draw.text(
-        (70, 150),
+        (75, 130),
         "VOTE WINNER",
-        font=get_font(100),
-        fill=(255, 240, 255),
-        stroke_width=5,
-        stroke_fill=(75, 0, 130)
+        font=font(105),
+        fill="white"
     )
 
     draw.text(
-        (100, 290),
+        (90, 280),
         "CONGRATULATIONS!",
-        font=get_font(48),
-        fill=(255, 200, 30)
+        font=font(45),
+        fill=(255, 210, 90)
     )
 
-    # Golden portrait ring
-    cx, cy, radius = 1190, 245, 155
-
+    # Winner ring
     draw.ellipse(
-        (cx-radius-15, cy-radius-15,
-         cx+radius+15, cy+radius+15),
-        fill=(255, 190, 20)
+        (1010, 65, 1450, 505),
+        fill=(255, 195, 40)
     )
 
     draw.ellipse(
-        (cx-radius, cy-radius,
-         cx+radius, cy+radius),
-        fill=(95, 15, 180)
+        (1030, 85, 1430, 485),
+        fill=(100, 45, 160)
     )
 
-    if photo:
+    # Name ribbon
+    draw.rounded_rectangle(
+        (900, 490, 1530, 585),
+        radius=30,
+        fill=(255, 195, 40)
+    )
 
-        try:
-            portrait = Image.open(
-                io.BytesIO(photo)
-            ).convert("RGB")
-
-            portrait = ImageOps.fit(
-                portrait,
-                (radius*2, radius*2)
-            )
-
-            mask = Image.new(
-                "L", (radius*2, radius*2), 0
-            )
-
-            ImageDraw.Draw(mask).ellipse(
-                (0, 0, radius*2, radius*2),
-                fill=255
-            )
-
-            img.paste(
-                portrait,
-                (cx-radius, cy-radius),
-                mask
-            )
-
-        except Exception:
-            pass
-
-    # Golden name ribbon
-    draw.polygon([
-        (970, 420),
-        (1410, 420),
-        (1460, 500),
-        (920, 500)
-    ], fill=(255, 185, 20))
-
-    label = name[:24]
-    font = get_font(42)
-
-    box = draw.textbbox((0, 0), label, font=font)
-    tw = box[2] - box[0]
+    label = name[:25]
 
     draw.text(
-        (cx-tw/2, 435),
+        (950, 510),
         label,
-        font=font,
-        fill=(75, 25, 0)
+        font=font(43),
+        fill=(55, 25, 80)
     )
 
     output = io.BytesIO()
 
-    img.save(
+    image.save(
         output,
         format="JPEG",
         quality=92
@@ -740,12 +1073,13 @@ def winner_image(name, photo=None):
     return output.getvalue()
 
 
+# ==========================================
+# FINISH CONTEST
+# ==========================================
+
 async def finish_contest(bot, cid):
 
-    contest = sql(
-        "SELECT * FROM contests WHERE id=?",
-        (cid,), "one"
-    )
+    contest, candidates, counts = get_contest(cid)
 
     if not contest or contest["status"] != "active":
         return
@@ -753,63 +1087,40 @@ async def finish_contest(bot, cid):
     if time.time() < contest["ends_at"]:
         return
 
-    sql(
+    query(
         "UPDATE contests SET status='finished' WHERE id=?",
         (cid,)
     )
 
-    await refresh_vote(bot, cid)
+    await refresh_votes(bot, cid)
 
-    winner = sql("""
-        SELECT c.id,c.name,c.photo,COUNT(v.user_id) AS votes
-        FROM candidates c
-        LEFT JOIN votes v ON c.id=v.candidate_id
-        WHERE c.contest_id=?
-        GROUP BY c.id
-        ORDER BY votes DESC,c.id ASC
-        LIMIT 1
-    """, (cid,), "one")
-
-    if not winner:
+    if not candidates:
         return
 
-    photo = None
-
-    if winner["photo"]:
-        try:
-            file = await bot.get_file(winner["photo"])
-            stream = io.BytesIO()
-
-            await bot.download_file(
-                file.file_path,
-                destination=stream
-            )
-
-            photo = stream.getvalue()
-
-        except Exception:
-            pass
-
-    image = winner_image(
-        winner["name"],
-        photo
+    winner = max(
+        candidates,
+        key=lambda c: (
+            counts.get(c["id"], 0),
+            -c["id"]
+        )
     )
 
-    total = sql(
-        "SELECT COUNT(*) n FROM votes WHERE contest_id=?",
-        (cid,), "one"
-    )["n"]
+    total = sum(counts.values())
+
+    image = make_winner_image(
+        winner["name"]
+    )
 
     caption = (
         "🏆 <b>ᴠᴏᴛᴇ ᴡɪɴɴᴇʀ</b>\n\n"
         f"👑 <b>{winner['name']}</b>\n"
-        f"🗳 ᴠᴏᴛᴇꜱ: <b>{winner['votes']}</b>\n"
+        f"🗳 ᴠᴏᴛᴇꜱ: {counts.get(winner['id'], 0)}\n"
         f"📊 ᴛᴏᴛᴀʟ ᴠᴏᴛᴇꜱ: {total}\n\n"
-        "✨ ᴄᴏɴɢʀᴀᴛᴜʟᴀᴛɪᴏɴꜱ!"
+        "🎉 ᴄᴏɴɢʀᴀᴛᴜʟᴀᴛɪᴏɴꜱ!"
     )
 
     await bot.send_photo(
-        contest["channel_id"],
+        contest["channel"],
         BufferedInputFile(
             image,
             filename="winner.jpg"
@@ -818,19 +1129,23 @@ async def finish_contest(bot, cid):
     )
 
 
-async def timer(bot, cid):
+# ==========================================
+# AUTOMATIC TIMER
+# ==========================================
+
+async def contest_timer(bot, cid):
 
     while True:
 
-        c = sql(
-            "SELECT ends_at,status FROM contests WHERE id=?",
-            (cid,), "one"
+        contest = query(
+            "SELECT * FROM contests WHERE id=?",
+            (cid,), fetch=True
         )
 
-        if not c or c["status"] != "active":
+        if not contest or contest["status"] != "active":
             return
 
-        remaining = c["ends_at"] - time.time()
+        remaining = contest["ends_at"] - time.time()
 
         if remaining <= 0:
             await finish_contest(bot, cid)
@@ -841,613 +1156,23 @@ async def timer(bot, cid):
         )
 
 
-# ==================================================
-# START COMMAND
-# ==================================================
-
-@dp.message(CommandStart())
-async def start(message: Message):
-
-    bid = message.bot.id
-
-    if is_admin(bid, message.from_user.id):
-        await home(message)
-        return
-
-    if await join_required(message):
-        await message.answer(
-            "👋 <b>ᴡᴇʟᴄᴏᴍᴇ</b>\n\n"
-            "ᴜꜱᴇ ᴠᴏᴛᴇ ʙᴜᴛᴛᴏɴꜱ ᴛᴏ ᴘᴀʀᴛɪᴄɪᴘᴀᴛᴇ."
-        )
-
-
-@dp.message(Command("admin"))
-async def admin(message):
-
-    if is_admin(
-        message.bot.id,
-        message.from_user.id
-    ):
-        await home(message)
-    else:
-        await message.answer("Admin only.")
-
-
-@dp.message(Command("addadmin"))
-async def addadmin(message):
-
-    if not is_admin(
-        message.bot.id,
-        message.from_user.id
-    ):
-        return
-
-    parts = message.text.split(maxsplit=1)
-
-    if len(parts) != 2 or not parts[1].isdigit():
-        await message.answer(
-            "Usage: /addadmin USER_ID"
-        )
-        return
-
-    admin_add(
-        message.bot.id,
-        int(parts[1])
-    )
-
-    await message.answer("✅ Admin added.")
-
-
-# ==================================================
-# DURATION CALLBACK
-# ==================================================
-
-@dp.callback_query(F.data.startswith("time:"))
-async def duration(call):
-
-    bid = call.bot.id
-    uid = call.from_user.id
-
-    if not is_admin(bid, uid):
-        await call.answer("Admin only.", show_alert=True)
-        return
-
-    state, title = get_state(bid, uid)
-
-    if state != "contest_duration":
-        await call.answer("Request expired.")
-        return
-
-    value = call.data.split(":")[1]
-
-    if value == "custom":
-
-        set_state(
-            bid, uid,
-            "custom_duration",
-            title
-        )
-
-        await call.message.answer(
-            "Custom time ঘণ্টায় লিখুন। Example: 3, 12, 36"
-        )
-
-    else:
-
-        seconds = int(value) * 3600
-
-        set_state(
-            bid, uid,
-            "contest_candidates",
-            title + "\n" + str(seconds)
-        )
-
-        await call.message.answer(
-            "প্রতি লাইনে Candidate লিখুন:\n\n"
-            "<code>RIFAT 5</code>\n"
-            "<code>ALFA 109</code>\n"
-            "<code>IRFAN 12 | PHOTO_FILE_ID</code>\n\n"
-            "কমপক্ষে ২ জন Candidate দিন।"
-        )
-
-    await call.answer()
-
-
-# ==================================================
-# MAIN TEXT HANDLER
-# ==================================================
-
-@dp.message(F.text)
-async def text_handler(message: Message):
-
-    bot = message.bot
-    bid = bot.id
-    uid = message.from_user.id
-    text = message.text.strip()
-
-    state, data = get_state(bid, uid)
-
-    # ---------------- CLONE ----------------
-
-    if state == "clone_token":
-
-        if bid != main_bot.id:
-            await message.answer(
-                "Main Bot থেকে Clone করুন।"
-            )
-            return
-
-        try:
-
-            child = Bot(
-                text,
-                default=DefaultBotProperties(
-                    parse_mode=ParseMode.HTML
-                )
-            )
-
-            me = await child.get_me()
-
-            if me.id == main_bot.id:
-                await child.session.close()
-                await message.answer(
-                    "Main Bot Token দেওয়া যাবে না।"
-                )
-                return
-
-            sql("""
-                INSERT OR REPLACE INTO bots
-                VALUES(?,?,?,?)
-            """, (
-                me.id,
-                text,
-                me.username,
-                uid
-            ))
-
-            admin_add(me.id, uid)
-
-            active_bots[me.id] = child
-
-            clear_state(bid, uid)
-
-            await message.answer(
-                "✅ <b>ʙᴏᴛ ᴄʟᴏɴᴇᴅ</b>\n\n"
-                f"🤖 @{me.username}\n\n"
-                "Clone registered successfully.\n"
-                "নতুন Clone চালু করতে Main Bot restart করুন।"
-            )
-
-        except Exception as e:
-
-            logging.exception(e)
-
-            await message.answer(
-                "❌ Invalid Bot Token."
-            )
-
-        return
-
-    # ---------------- ADMIN CHECK ----------------
-
-    if not is_admin(bid, uid):
-
-        await join_required(message)
-        return
-
-    # ---------------- ADD CHANNEL ----------------
-
-    if state == "add_channel":
-
-        parts = text.split("|", 1)
-
-        channel = parts[0].strip()
-
-        invite = (
-            parts[1].strip()
-            if len(parts) > 1
-            else (
-                "https://t.me/" + channel[1:]
-                if channel.startswith("@")
-                else ""
-            )
-        )
-
-        if not invite:
-            await message.answer(
-                "Private Channel Format:\n"
-                "<code>-100123456789|https://t.me/+invite</code>"
-            )
-            return
-
-        try:
-
-            ch = await bot.get_chat(channel)
-
-            member = await bot.get_chat_member(
-                ch.id, bot.id
-            )
-
-            if member.status not in (
-                ChatMemberStatus.ADMINISTRATOR,
-                ChatMemberStatus.OWNER
-            ):
-                await message.answer(
-                    "Bot-কে Channel Admin করুন।"
-                )
-                return
-
-            sql("""
-                INSERT OR IGNORE INTO channels(
-                    bot_id,chat_id,title,join_url
-                ) VALUES(?,?,?,?)
-            """, (
-                bid,
-                str(ch.id),
-                ch.title or "Channel",
-                invite
-            ))
-
-            clear_state(bid, uid)
-
-            await message.answer(
-                "✅ Channel Added.",
-                reply_markup=main_menu()
-            )
-
-        except Exception as e:
-
-            await message.answer(
-                "Channel add failed:\n" + str(e)[:200]
-            )
-
-        return
-
-    # ---------------- VOTE CHANNEL ----------------
-
-    if state == "set_vote_channel":
-
-        try:
-
-            ch = await bot.get_chat(text)
-
-            member = await bot.get_chat_member(
-                ch.id, bot.id
-            )
-
-            if member.status not in (
-                ChatMemberStatus.ADMINISTRATOR,
-                ChatMemberStatus.OWNER
-            ):
-                await message.answer(
-                    "Bot-কে Vote Channel Admin করুন।"
-                )
-                return
-
-            sql("""
-                INSERT INTO settings(bot_id,vote_channel)
-                VALUES(?,?)
-                ON CONFLICT(bot_id)
-                DO UPDATE SET vote_channel=excluded.vote_channel
-            """, (bid, str(ch.id)))
-
-            clear_state(bid, uid)
-
-            await message.answer(
-                "✅ Vote Channel Set.",
-                reply_markup=main_menu()
-            )
-
-        except Exception as e:
-
-            await message.answer(
-                "Invalid Channel:\n" + str(e)[:200]
-            )
-
-        return
-
-    # ---------------- REMOVE CHANNEL ----------------
-
-    if state == "remove_channel":
-
-        sql("""
-            DELETE FROM channels
-            WHERE bot_id=? AND (chat_id=? OR title=?)
-        """, (bid, text, text))
-
-        clear_state(bid, uid)
-
-        await message.answer(
-            "✅ Channel Removed.",
-            reply_markup=main_menu()
-        )
-
-        return
-
-    # ---------------- CONTEST TITLE ----------------
-
-    if state == "contest_title":
-
-        set_state(
-            bid, uid,
-            "contest_duration",
-            text[:100]
-        )
-
-        await message.answer(
-            "ᴠᴏᴛɪɴɢ ᴛɪᴍᴇ ꜱᴇʟᴇᴄᴛ ᴋᴏʀᴜɴ:",
-            reply_markup=duration_buttons()
-        )
-
-        return
-
-    # ---------------- CUSTOM TIME ----------------
-
-    if state == "custom_duration":
-
-        try:
-
-            hours = float(text)
-
-            if hours <= 0 or hours > 720:
-                raise ValueError
-
-            set_state(
-                bid, uid,
-                "contest_candidates",
-                data + "\n" + str(int(hours * 3600))
-            )
-
-            await message.answer(
-                "প্রতি লাইনে Candidate লিখুন:\n"
-                "<code>RIFAT 5</code>\n"
-                "<code>ALFA 109</code>\n"
-                "Optional Photo:\n"
-                "<code>IRFAN 12 | PHOTO_FILE_ID</code>\n\n"
-                "কমপক্ষে ২ জন Candidate দিন।"
-            )
-
-        except ValueError:
-
-            await message.answer(
-                "Valid time দিন। Maximum 720 hours."
-            )
-
-        return
-
-    # ---------------- CREATE CONTEST ----------------
-
-    if state == "contest_candidates":
-
-        try:
-
-            title, seconds = data.rsplit("\n", 1)
-
-            candidates = []
-
-            for line in text.splitlines():
-
-                if not line.strip():
-                    continue
-
-                parts = line.split("|", 1)
-
-                name = parts[0].strip()[:50]
-
-                photo = (
-                    parts[1].strip()
-                    if len(parts) > 1
-                    else ""
-                )
-
-                if name:
-                    candidates.append((name, photo))
-
-            if len(candidates) < 2:
-
-                await message.answer(
-                    "কমপক্ষে ২ জন Candidate দিন।"
-                )
-                return
-
-            channel = get_vote_channel(bid)
-
-            if not channel:
-
-                await message.answer(
-                    "আগে Vote Channel Set করুন।"
-                )
-                return
-
-            cid = create_contest(
-                bid,
-                uid,
-                title,
-                channel,
-                int(seconds),
-                candidates
-            )
-
-            await publish_contest(bot, cid)
-
-            asyncio.create_task(
-                timer(bot, cid)
-            )
-
-            clear_state(bid, uid)
-
-            await message.answer(
-                f"✅ Contest #{cid} Published!",
-                reply_markup=main_menu()
-            )
-
-        except Exception as e:
-
-            logging.exception(e)
-
-            await message.answer(
-                "Contest publish failed:\n" + str(e)[:200]
-            )
-
-        return
-
-    # ==================================================
-    # MENU ACTIONS
-    # ==================================================
-
-    if text == "🤖 ᴄʟᴏɴᴇ ʙᴏᴛ":
-
-        if bid != main_bot.id:
-            await message.answer(
-                "Main Bot ব্যবহার করুন।"
-            )
-            return
-
-        set_state(
-            bid, uid,
-            "clone_token"
-        )
-
-        await message.answer(
-            "BotFather থেকে নতুন Bot Token পাঠান।\n"
-            "Token কাউকে শেয়ার করবেন না।"
-        )
-
-    elif text == "➕ ᴀᴅᴅ ᴄʜᴀɴɴᴇʟ":
-
-        set_state(
-            bid, uid,
-            "add_channel"
-        )
-
-        await message.answer(
-            "Public:\n"
-            "<code>@channelusername</code>\n\n"
-            "Private:\n"
-            "<code>-100123456789|https://t.me/+invite</code>"
-        )
-
-    elif text == "📢 ꜱᴇᴛ ᴠᴏᴛᴇ ᴄʜᴀɴɴᴇʟ":
-
-        set_state(
-            bid, uid,
-            "set_vote_channel"
-        )
-
-        await message.answer(
-            "Vote Channel-এর @username অথবা -100 ID দিন।"
-        )
-
-    elif text == "🗑 ʀᴇᴍᴏᴠᴇ ᴄʜᴀɴɴᴇʟ":
-
-        chs = get_channels(bid)
-
-        if not chs:
-            await message.answer("No channels added.")
-            return
-
-        listing = "\n".join(
-            f"{c['title']} | {c['chat_id']}"
-            for c in chs
-        )
-
-        set_state(
-            bid, uid,
-            "remove_channel"
-        )
-
-        await message.answer(
-            "Remove করতে Channel ID অথবা title পাঠান:\n\n"
-            + listing
-        )
-
-    elif text == "🆕 ɴᴇᴡ ᴄᴏɴᴛᴇꜱᴛ":
-
-        set_state(
-            bid, uid,
-            "contest_title"
-        )
-
-        await message.answer(
-            "Contest Title লিখুন:"
-        )
-
-    elif text == "📊 ᴍʏ ᴄᴏɴᴛᴇꜱᴛꜱ":
-
-        rows = sql(
-            "SELECT * FROM contests WHERE bot_id=? ORDER BY id DESC LIMIT 20",
-            (bid,), "all"
-        )
-
-        if not rows:
-            await message.answer("No contests.")
-            return
-
-        result = ["<b>📊 ᴍʏ ᴄᴏɴᴛᴇꜱᴛꜱ</b>"]
-
-        for r in rows:
-            result.append(
-                f"#{r['id']} | {r['title']} | {r['status']}"
-            )
-
-        await message.answer("\n".join(result))
-
-    elif text == "📈 ꜱᴛᴀᴛᴜꜱ":
-
-        total = sql(
-            "SELECT COUNT(*) n FROM contests WHERE bot_id=?",
-            (bid,), "one"
-        )["n"]
-
-        voters = sql("""
-            SELECT COUNT(DISTINCT v.user_id) n
-            FROM votes v
-            JOIN contests c ON c.id=v.contest_id
-            WHERE c.bot_id=?
-        """, (bid,), "one")["n"]
-
-        await message.answer(
-            f"<b>📈 ꜱᴛᴀᴛᴜꜱ</b>\n\n"
-            f"ᴄᴏɴᴛᴇꜱᴛꜱ: {total}\n"
-            f"ᴠᴏᴛᴇʀꜱ: {voters}\n"
-            f"ᴄʜᴀɴɴᴇʟꜱ: {len(get_channels(bid))}"
-        )
-
-    elif text == "❓ ʜᴇʟᴘ":
-
-        await message.answer(
-            "<b>ʜᴇʟᴘ & ɢᴜɪᴅᴇ</b>\n\n"
-            "1. Add Channel\n"
-            "2. Set Vote Channel\n"
-            "3. New Contest\n"
-            "4. Set Duration\n"
-            "5. Add Candidates\n"
-            "6. Publish Contest\n\n"
-            "Vote can be changed before the timer ends.\n"
-            "Admin add: /addadmin USER_ID"
-        )
-
-    else:
-
-        await message.answer(
-            "Menu থেকে একটি Option নির্বাচন করুন।",
-            reply_markup=main_menu()
-        )
-
-
-# ==================================================
+# ==========================================
 # STARTUP
-# ==================================================
+# ==========================================
 
 async def main():
 
     global main_bot
 
-    if BOT_TOKEN == "PASTE_MAIN_BOT_TOKEN":
-        raise RuntimeError("BOT_TOKEN বসাও।")
+    if BOT_TOKEN == "YOUR_BOT_TOKEN":
+        raise RuntimeError(
+            "Configure BOT_TOKEN first."
+        )
 
     if OWNER_ID <= 0:
-        raise RuntimeError("OWNER_ID বসাও।")
+        raise RuntimeError(
+            "Configure OWNER_ID first."
+        )
 
     init_db()
 
@@ -1458,68 +1183,20 @@ async def main():
         )
     )
 
-    main_id = (await main_bot.get_me()).id
-
-    admin_add(main_id, OWNER_ID)
-
-    bots = [main_bot]
-
-    # Load saved clone bots
-    saved = sql(
-        "SELECT bot_id,token FROM bots",
-        (), "all"
+    # Restore unfinished contests
+    contests = query(
+        "SELECT id FROM contests WHERE status='active'",
+        all_rows=True
     )
 
-    for row in saved:
-
-        try:
-
-            child = Bot(
-                row["token"],
-                default=DefaultBotProperties(
-                    parse_mode=ParseMode.HTML
-                )
-            )
-
-            me = await child.get_me()
-
-            if me.id != row["bot_id"]:
-                await child.session.close()
-                continue
-
-            active_bots[me.id] = child
-            bots.append(child)
-
-        except Exception as e:
-
-            logging.error(
-                "Clone startup failed: %s",
-                e
-            )
-
-    # Restore active timers
-    for bot in bots:
-
-        contests = sql(
-            "SELECT id FROM contests WHERE bot_id=? AND status='active'",
-            (bot.id,), "all"
+    for contest in contests:
+        asyncio.create_task(
+            contest_timer(main_bot, contest["id"])
         )
 
-        for c in contests:
+    logging.info("Vote Maker Bot started successfully.")
 
-            asyncio.create_task(
-                timer(bot, c["id"])
-            )
-
-    logging.info(
-        "Starting %s Telegram bots",
-        len(bots)
-    )
-
-    await dp.start_polling(
-        *bots,
-        allowed_updates=dp.resolve_used_update_types()
-    )
+    await dp.start_polling(main_bot)
 
 
 if __name__ == "__main__":
